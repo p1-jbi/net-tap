@@ -68,6 +68,161 @@ macos_release_lock() {
     fi
 }
 
+macos_pf_acquire_lease() {
+    local pf_output active_rules
+    if ! command -v pfctl >/dev/null 2>&1; then
+        log_err "Missing required dependency: pfctl (needed to reduce macOS interface egress)."
+        return 1
+    fi
+    if ! pf_output="$(pfctl -E 2>&1)"; then
+        log_err "Could not enable or acquire a PF lease: ${pf_output}"
+        return 1
+    fi
+    PF_ENABLE_TOKEN="$(printf '%s\n' "${pf_output}" | sed -nE 's/.*Token[[:space:]]*:[[:space:]]*([[:alnum:]]+).*/\1/p' | tail -n 1)"
+    if [[ -z "${PF_ENABLE_TOKEN}" ]]; then
+        log_err "PF did not return an enable token; refusing to install an untracked egress rule."
+        return 1
+    fi
+    if ! active_rules="$(pfctl -sr 2>&1)" || ! grep -Fq 'anchor "com.apple/*"' <<< "${active_rules}"; then
+        log_err "The active PF ruleset does not expose Apple's com.apple/* anchor; refusing to load an inactive egress rule."
+        return 1
+    fi
+}
+
+macos_install_egress_guard() {
+    local iface="$1" anchor="$2" state_file="${3:-}" pf_rules_file pf_rules
+    if ! [[ "${iface}" =~ ^[[:alnum:]_.:-]+$ ]]; then
+        log_err "Invalid interface name '${iface}' for macOS egress protection."
+        return 1
+    fi
+    if ! [[ "${anchor}" =~ ^com\.apple/net-tap/[[:alnum:]_.-]+$ ]]; then
+        log_err "Refusing to install PF rules into unexpected anchor '${anchor}'."
+        return 1
+    fi
+
+    local ifconfig_output
+    ifconfig_output="$(ifconfig "${iface}")" || {
+        log_err "Could not inspect interface '${iface}' before applying egress protection."
+        return 1
+    }
+    if ! grep -qE '<[^>]*NOARP' <<< "${ifconfig_output}"; then
+        if ifconfig "${iface}" -arp; then
+            ARP_CHANGED_IFACES+=("${iface}")
+            if [[ -n "${state_file}" ]]; then
+                _macos_write_state_file "${state_file}" || return 1
+            fi
+        else
+            log_warn "Could not disable ARP on ${iface}; PF will still block outbound IP traffic."
+        fi
+    fi
+
+    pf_rules_file="$(mktemp "${STATE_DIR}/.pf-rules.XXXXXX")" || {
+        log_err "Could not create a temporary PF rules file in ${STATE_DIR}."
+        return 1
+    }
+    if ! chmod 600 "${pf_rules_file}" ||
+       ! printf 'block drop out quick on %s all\n' "${iface}" > "${pf_rules_file}"; then
+        rm -f "${pf_rules_file}"
+        log_err "Could not prepare the PF rules file for ${iface}."
+        return 1
+    fi
+    if ! pfctl -a "${anchor}" -f "${pf_rules_file}"; then
+        rm -f "${pf_rules_file}"
+        log_err "Could not install the PF outbound block for ${iface}."
+        return 1
+    fi
+    PF_ANCHORS+=("${anchor}")
+    if [[ -n "${state_file}" ]]; then
+        if ! _macos_write_state_file "${state_file}"; then
+            rm -f "${pf_rules_file}"
+            return 1
+        fi
+    fi
+    if ! rm -f "${pf_rules_file}"; then
+        log_err "Installed the PF outbound block for ${iface}, but could not remove temporary rules file '${pf_rules_file}'."
+        return 1
+    fi
+
+    pf_rules="$(pfctl -a "${anchor}" -sr 2>&1)" || {
+        log_err "Could not verify the PF outbound block for ${iface}: ${pf_rules}"
+        return 1
+    }
+    if [[ "${pf_rules}" != *"block drop out quick on ${iface} all"* ]]; then
+        log_err "PF did not report the expected outbound block for ${iface}; refusing to claim egress protection."
+        return 1
+    fi
+}
+
+macos_restore_egress_guards() {
+    local iface anchor restore_failed=0
+    local -a remaining_arp_ifaces=() remaining_anchors=()
+    declare -p ARP_CHANGED_IFACES >/dev/null 2>&1 || ARP_CHANGED_IFACES=()
+    declare -p PF_ANCHORS >/dev/null 2>&1 || PF_ANCHORS=()
+
+    for iface in "${ARP_CHANGED_IFACES[@]}"; do
+        if ifconfig "${iface}" arp; then
+            :
+        else
+            log_err "Could not restore ARP on ${iface}; keeping its egress guard state for retry."
+            remaining_arp_ifaces+=("${iface}")
+            restore_failed=1
+        fi
+    done
+    ARP_CHANGED_IFACES=("${remaining_arp_ifaces[@]}")
+    if [[ "${restore_failed}" -ne 0 ]]; then
+        return 1
+    fi
+
+    for anchor in "${PF_ANCHORS[@]}"; do
+        if ! [[ "${anchor}" =~ ^com\.apple/net-tap/[[:alnum:]_.-]+$ ]]; then
+            log_err "Refusing to remove unexpected PF anchor '${anchor}'."
+            remaining_anchors+=("${anchor}")
+            restore_failed=1
+        elif pfctl -a "${anchor}" -F rules; then
+            :
+        else
+            log_err "Could not remove net-tap PF rules from '${anchor}'."
+            remaining_anchors+=("${anchor}")
+            restore_failed=1
+        fi
+    done
+    PF_ANCHORS=("${remaining_anchors[@]}")
+    if [[ "${restore_failed}" -ne 0 ]]; then
+        return 1
+    fi
+
+    if [[ -n "${PF_ENABLE_TOKEN:-}" ]]; then
+        if pfctl -X "${PF_ENABLE_TOKEN}"; then
+            PF_ENABLE_TOKEN=""
+        else
+            log_err "Could not release net-tap's PF enable lease; PF remains enabled."
+            return 1
+        fi
+    fi
+}
+
+_macos_write_state_file() {
+    local state_file="$1" state_tmp
+    state_tmp="$(mktemp "${STATE_DIR}/.state.XXXXXX")" || {
+        log_err "Could not create a temporary capture state file in ${STATE_DIR}."
+        return 1
+    }
+    if ! {
+        declare -p IFACE MODE TIMESTAMP OUT_DIR ROTATE_SIZE ROTATE_COUNT
+        declare -p PIDS_TCPDUMP PCAP_FILES TCPDUMP_ERRS
+        declare -p PF_ANCHORS ARP_CHANGED_IFACES PF_ENABLE_TOKEN
+    } > "${state_tmp}"; then
+        rm -f "${state_tmp}"
+        log_err "Could not serialize capture state for ${IFACE}."
+        return 1
+    fi
+    if ! mv -f "${state_tmp}" "${state_file}"; then
+        rm -f "${state_tmp}"
+        log_err "Could not write capture state file '${state_file}'."
+        return 1
+    fi
+}
+
 _macos_startup_cleanup() {
     local exit_code=$?
     if [[ "${exit_code}" -ne 0 ]]; then
@@ -79,7 +234,18 @@ _macos_startup_cleanup() {
                 kill -TERM "${pid}" 2>/dev/null || true
             fi
         done
-        [[ -n "${state_tmp:-}" ]] && rm -f "${state_tmp}"
+        if ! macos_restore_egress_guards; then
+            log_err "macOS egress safeguards could not be fully restored after startup failure."
+            if ! _macos_write_state_file "${state_file}"; then
+                log_err "Could not save recovery state; manually inspect PF anchor(s) and ARP settings for ${IFACE}."
+            else
+                log_err "Recovery state saved; retry 'off -i ${IFACE}' to finish cleanup."
+            fi
+        elif [[ "${state_created:-0}" -eq 1 ]]; then
+            if ! rm -f "${state_file}"; then
+                log_err "Could not remove temporary startup state '${state_file}'; run 'off -i ${IFACE}' to verify cleanup."
+            fi
+        fi
     fi
     macos_release_lock
     return "${exit_code}"
@@ -113,7 +279,9 @@ start_tap_macos() {
     local lock_dir="${state_file}.lockdir"
     macos_acquire_lock "${lock_dir}" || exit 1
     local -a PIDS_TCPDUMP=() PCAP_FILES=() TCPDUMP_ERRS=()
-    local state_tmp=""
+    local -a PF_ANCHORS=() ARP_CHANGED_IFACES=()
+    local PF_ENABLE_TOKEN=""
+    local state_created=0
     trap '_macos_startup_cleanup' EXIT
     trap 'exit 130' INT
     trap 'exit 143' TERM HUP
@@ -124,7 +292,18 @@ start_tap_macos() {
 
     local timestamp
     timestamp="$(date '+%Y%m%d_%H%M%S')"
-    local iface pcap_file error_file
+    local iface pcap_file error_file iface_index=0
+    MODE="passive"
+    TIMESTAMP="${timestamp}"
+    macos_pf_acquire_lease || exit 1
+    state_created=1
+    _macos_write_state_file "${state_file}" || exit 1
+    for iface in "${IFACES_ARR[@]}"; do
+        local anchor="com.apple/net-tap/session_$$_${iface_index}"
+        macos_install_egress_guard "${iface}" "${anchor}" "${state_file}" || exit 1
+        iface_index=$((iface_index + 1))
+    done
+
     for iface in "${IFACES_ARR[@]}"; do
         pcap_file="${OUT_DIR}/${timestamp}_${iface}_trace.pcap"
         error_file="${OUT_DIR}/${timestamp}_${iface}_tcpdump.log"
@@ -144,6 +323,7 @@ start_tap_macos() {
         PIDS_TCPDUMP+=("${pid}")
         PCAP_FILES+=("${pcap_file}")
         TCPDUMP_ERRS+=("${error_file}")
+        _macos_write_state_file "${state_file}" || exit 1
         local attempts=0
         while (( attempts < 50 )); do
             if macos_capture_process_matches "${pid}" "${iface}" "${pcap_file}"; then
@@ -162,26 +342,11 @@ start_tap_macos() {
         fi
     done
 
-    MODE="passive"
-    TIMESTAMP="${timestamp}"
-    state_tmp="$(mktemp "${STATE_DIR}/.state.XXXXXX")"
-    chmod 600 "${state_tmp}"
-    {
-        declare -p IFACE MODE TIMESTAMP OUT_DIR ROTATE_SIZE ROTATE_COUNT
-        declare -p PIDS_TCPDUMP PCAP_FILES TCPDUMP_ERRS
-    } > "${state_tmp}"
-    if ! mv -f "${state_tmp}" "${state_file}"; then
-        for pid in "${PIDS_TCPDUMP[@]}"; do
-            kill -TERM "${pid}" 2>/dev/null || true
-        done
-        log_err "Could not write capture state file '${state_file}'."
-        exit 1
-    fi
-    chmod 644 "${state_file}"
+    _macos_write_state_file "${state_file}" || exit 1
 
     trap - EXIT INT TERM HUP
     macos_release_lock
-    log_warn "macOS capture is read-only with respect to interface configuration, but does not block host egress. It is not equivalent to Linux zero-egress mode."
+    log_warn "macOS PF blocks outbound IP traffic and ARP is disabled where supported; other Ethernet-layer emissions may remain, so this is not Linux zero-egress mode."
     log_ok "Capture started on ${IFACE}; output: ${OUT_DIR}"
 }
 
@@ -227,10 +392,14 @@ stop_tap_macos() {
             log_warn "Capture PID ${pid} no longer matches its recorded tcpdump command; refusing to signal it."
         fi
     done
+    if ! macos_restore_egress_guards; then
+        log_err "Capture stopped, but macOS egress safeguards remain; retry 'off' to complete cleanup."
+        exit 1
+    fi
     rm -f "${state_file}"
     trap - EXIT INT TERM HUP
     macos_release_lock
-    log_ok "Capture stopped; PCAP files were flushed. macOS interface settings were not changed."
+    log_ok "Capture stopped; PCAP files were flushed and net-tap's macOS egress safeguards were restored."
 }
 
 status_tap_macos() {
@@ -258,6 +427,11 @@ status_tap_macos() {
             macos_capture_process_matches "${pid}" "${IFACES_ARR[$i]}" "${PCAP_FILES[$i]}" && running=$((running + 1))
         done
         echo "Capture: $([[ ${running} -gt 0 ]] && echo RUNNING || echo STOPPED) (${running} tcpdump process(es))"
+        if [[ -n "${PF_ENABLE_TOKEN:-}" && -n "${PF_ANCHORS[*]:-}" ]]; then
+            echo "Egress reduction: PF outbound IP block; ARP disabled where supported (not a Layer-2 zero-egress guarantee)"
+        else
+            echo "Egress reduction: no active safeguard recorded (legacy or incomplete startup state)"
+        fi
         echo "Output directory: ${OUT_DIR}"
     else
         echo "Capture: not running"

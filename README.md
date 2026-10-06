@@ -9,12 +9,12 @@
 [![CI](https://github.com/Nementon/net-tap/actions/workflows/ci.yml/badge.svg)](https://github.com/Nementon/net-tap/actions/workflows/ci.yml)
 ![License](https://img.shields.io/badge/License-Beerware-orange)
 
-`net-tap` is a network capture and analysis suite for Linux and macOS. Linux provides the complete stealth tap and active telemetry feature set. macOS supports PCAP capture and offline analysis only; it does not enforce egress blocking, support active probes, Linux network namespaces, or Linux NIC tuning.
+`net-tap` is a network capture and analysis suite for Linux and macOS. Linux provides the complete stealth tap and active telemetry feature set. macOS supports PCAP capture with best-effort outbound IP/ARP suppression and offline analysis; it does not provide a complete zero-egress guarantee, active probes, Linux network namespaces, or Linux NIC tuning.
 
 ### Two Operating Modes:
 * **Linux passive stealth mode (default)**: Enforces the Linux kernel egress lock (`tc clsact`, Netfilter raw rules, and sysctls) while capturing traffic.
 * **Linux active probing mode (`--mode active`)**: Combines capture with audited probes and the Linux selective-egress filter.
-* **macOS capture mode**: Captures and rotates PCAP files through `tcpdump`/BPF without reconfiguring the interface. macOS does **not** provide net-tap's zero-egress or selective-egress guarantees; active mode is rejected.
+* **macOS capture mode**: Captures and rotates PCAP files through `tcpdump`/BPF, loads a net-tap PF anchor to block outbound IP traffic on selected interfaces, and disables ARP where supported. `off` removes those rules, releases net-tap's PF enable lease, and restores ARP. This is best-effort emission reduction, not a Layer-2 zero-egress guarantee; other Ethernet-layer traffic may remain and active mode is rejected.
 
 ---
 
@@ -78,7 +78,7 @@ To analyze the captured data:
 net-tap analyze -d /data/trace
 ```
 
-On macOS, `net-tap on -i en0 -o ./captures` starts a PCAP capture only. It does not block the host from transmitting on that interface.
+On macOS, `net-tap on -i en0 -o ./captures` starts a PCAP capture and attempts to block outbound IP traffic with PF and disable ARP on that interface. Other Ethernet-layer traffic may still be transmitted.
 
 ---
 
@@ -237,7 +237,7 @@ sudo capsh --user=$USER --inh=cap_net_admin,cap_net_raw,cap_sys_admin --addamb=c
 
 Linux supports kernels 3.10+ (4.19+ recommended for full `clsact` support). When running inside Docker or Podman, use `--privileged` (or at minimum `--cap-add=NET_ADMIN --cap-add=NET_RAW`) for Linux interface controls and packet capture.
 
-macOS supports capture and PCAP analysis only. Use Bash 4.3 or newer (for example, `brew install bash`) and ensure Homebrew's `bin` directory is on `PATH` so the script uses that Bash instead of the system Bash 3.2. Install `tcpdump`/libpcap tools, Python 3, Scapy, cryptography, and jsonschema for capture, fixture generation, and tests. Interface names and link diagnostics follow macOS conventions (for example, `en0`).
+macOS supports capture and PCAP analysis, with best-effort outbound IP/ARP suppression during passive capture. The macOS PF rules are scoped to net-tap-owned anchors; PF must expose Apple's `com.apple/*` anchor for them to be active. `pf` does not block every Ethernet-layer protocol, so use a receive-only TAP or switch configuration when transmission onto the monitored network must be impossible. Use Bash 4.3 or newer (for example, `brew install bash`) and ensure Homebrew's `bin` directory is on `PATH` so the script uses that Bash instead of the system Bash 3.2. Install `tcpdump`/libpcap tools, Python 3, Scapy, cryptography, and jsonschema for capture, fixture generation, and tests. Interface names and link diagnostics follow macOS conventions (for example, `en0`).
 
 ### Required Dependencies (Checked on startup)
 * `iproute2` (`ip`, `tc`, `ss`)
@@ -304,15 +304,15 @@ net-tap [on|off|status|analyze|probe|list|clean] [options]
 
 | Subcommand | Privilege | Description |
 | :--- | :--- | :--- |
-| `on` | `sudo` | On Linux, provisions passive/active tap mode and rotating capture; on macOS, starts read-only PCAP capture without egress blocking. |
-| `off` | `sudo` | Stops capture; Linux also removes `tc` filters and restores the original NIC state. |
+| `on` | `sudo` | On Linux, provisions passive/active tap mode and rotating capture; on macOS, starts capture with best-effort PF outbound-IP blocking and ARP suppression. |
+| `off` | `sudo` | Stops capture; Linux removes `tc` filters and restores NIC state, while macOS removes its PF rules and restores ARP. |
 | `status` | Standard User | Inspects interface/capture status; detailed hardware counters and link tuning are Linux-only. |
 | `analyze` | Standard User | Performs deep protocol inspection and network mapping against a directory of PCAP traces. |
 | `probe` | `sudo` | Injects rate-limited discovery probes (ARP, NDP, DHCP, PMTU, TCP SYN) with structured audit trails. |
 | `list` | Standard User | Enumerates capture sessions; Linux additionally supports network namespaces and stale-session cleanup. |
 | `clean` | `sudo` | Reconciles crashed sessions, terminates orphaned processes, purges stale locks, and detaches dangling filters. |
 
-On macOS, only `on`, `off`, `status`, `analyze`, and `list` are supported, and `on` performs capture without egress protection. `probe`, `clean`, namespaces, timed shutdown, and Linux-specific interface controls are unavailable.
+On macOS, only `on`, `off`, `status`, `analyze`, and `list` are supported. Passive `on` applies best-effort PF outbound-IP blocking and disables ARP where supported; it is not a guarantee against all link-layer emissions. `probe`, `clean`, namespaces, timed shutdown, and Linux-specific interface controls are unavailable.
 
 ---
 
@@ -327,7 +327,7 @@ On macOS, only `on`, `off`, `status`, `analyze`, and `list` are supported, and `
 | Flag | Long Option | Description | Default |
 | :--- | :--- | :--- | :--- |
 | `-i` | `--interface` | **(Required)** Target interface(s), comma-separated (e.g. `eth1` or `sfp0,sfp1`). | None |
-| `-m` | `--mode` | Operational mode: `passive` (strict zero-egress stealth) or `active` (permits explicitly marked audit probes via `net-tap probe` while continuing to drop unsolicited OS emissions). | `passive` |
+| `-m` | `--mode` | Operational mode: Linux `passive` (strict zero-egress stealth) or `active` (permits explicitly marked audit probes while continuing to drop unsolicited OS emissions). macOS supports passive capture with best-effort egress reduction only. | `passive` |
 | `-o` | `--output-dir` | Target directory for PCAP traces and optical/link logs. | `./captures` |
 | `-t` | `--type` | Hardware type: `ethernet` or `sfp`. | `ethernet` |
 | `-s` | `--speed` | Force link speed in Mbps for SFP transceivers (e.g. `1000`, `10000`). | Auto |

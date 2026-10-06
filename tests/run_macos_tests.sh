@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # shellcheck shell=bash
+# shellcheck disable=SC2034,SC2329,SC1091
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -63,4 +64,54 @@ sessions = json.load(sys.stdin)
 assert len(sessions) == 1 and sessions[0]["interface"] == "en0"
 assert sessions[0]["status"] == "STOPPED"
 '
+
+echo "[TEST] macOS egress safeguards install and restore through scoped PF anchors..."
+(
+    NET_TAP_OS=Darwin
+    STATE_DIR="${TEST_STATE_DIR}/state"
+    MOCK_PF_RULE=""
+    MOCK_ARP_DISABLED=0
+    MOCK_ARP_RESTORED=0
+    log_err() { echo "$*" >&2; }
+    log_warn() { echo "$*" >&2; }
+    pfctl() {
+        case "$1" in
+            -E) printf 'Token : 4321\n' ;;
+            -sr) printf 'anchor "com.apple/*" all\n' ;;
+            -a)
+                case "$3" in
+                    -f) MOCK_PF_RULE="$(cat "$4")" ;;
+                    -sr) printf '%s\n' "${MOCK_PF_RULE}" ;;
+                    -F) MOCK_PF_RULE="" ;;
+                    *) return 1 ;;
+                esac
+                ;;
+            -X) [[ "$2" == "4321" ]] ;;
+            *) return 1 ;;
+        esac
+    }
+    ifconfig() {
+        if [[ $# -eq 1 ]]; then
+            printf 'flags=8863<UP,BROADCAST,ARP>\n'
+        elif [[ "$2" == "-arp" ]]; then
+            MOCK_ARP_DISABLED=1
+        elif [[ "$2" == "arp" ]]; then
+            MOCK_ARP_RESTORED=1
+        else
+            return 1
+        fi
+    }
+    source "${SCRIPT_DIR}/../lib/macos.sh"
+    PF_ANCHORS=()
+    ARP_CHANGED_IFACES=()
+    PF_ENABLE_TOKEN=""
+    macos_pf_acquire_lease
+    macos_install_egress_guard "enTest" "com.apple/net-tap/session_123_0"
+    [[ "${PF_ENABLE_TOKEN}" == "4321" ]]
+    [[ "${MOCK_PF_RULE}" == "block drop out quick on enTest all" ]]
+    [[ "${MOCK_ARP_DISABLED}" -eq 1 ]]
+    macos_restore_egress_guards
+    [[ -z "${MOCK_PF_RULE}" && -z "${PF_ENABLE_TOKEN}" ]]
+    [[ "${MOCK_ARP_RESTORED}" -eq 1 ]]
+)
 echo "macOS tests passed."
