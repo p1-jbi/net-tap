@@ -4,16 +4,17 @@
 
 # Net-Tap: Stealth Tap & Active Telemetry Suite
 
-![Platform](https://img.shields.io/badge/Platform-Linux-blue)
+![Platform](https://img.shields.io/badge/Platforms-Linux%20%7C%20macOS-blue)
 ![ShellCheck](https://img.shields.io/badge/ShellCheck-Passing-brightgreen)
 [![CI](https://github.com/Nementon/net-tap/actions/workflows/ci.yml/badge.svg)](https://github.com/Nementon/net-tap/actions/workflows/ci.yml)
 ![License](https://img.shields.io/badge/License-Beerware-orange)
 
-`net-tap` is an automated, network intelligence, stealth packet tapping, and active telemetry suite for Linux. It securely provisions physical or virtual interfaces into a **guaranteed zero-egress promiscuous capture state** (for passive monitoring) or a **watermarked selective-egress state** (for controlled active auditing), manages high-performance ring-buffered packet captures with proactive storage protection, and executes deep protocol analysis to instantly map complex dual-stack (IPv4/IPv6) enterprise and telecommunications networks.
+`net-tap` is a network capture and analysis suite for Linux and macOS. Linux provides the complete stealth tap and active telemetry feature set. macOS supports PCAP capture and offline analysis only; it does not enforce egress blocking, support active probes, Linux network namespaces, or Linux NIC tuning.
 
 ### Two Operating Modes:
-* **Passive Stealth Mode (default)**: Enforces an unconditional hardware and kernel egress lock (via `tc clsact`, Netfilter `raw` drops, and 36 non-destructive sysctls) guaranteeing **0 outbound bytes** leak onto the monitored wire while capturing full line-rate traffic.
-* **Active Probing Mode (`--mode active`)**: Combines continuous passive recording with precision active auditing (`--arp-scan`, `--ndp-scan`, `--dhcp-discover`, `--dhcp-discover6`, `--icmp-pmtu`, `--tcp-syn`). Outbound probes are strictly tagged with watermarks (`0x7a9` / 1961), while all spontaneous host OS chatter (such as unsolicited kernel TCP RSTs or IPv6 SLAAC/DAD packets) is completely blocked at the kernel egress gate.
+* **Linux passive stealth mode (default)**: Enforces the Linux kernel egress lock (`tc clsact`, Netfilter raw rules, and sysctls) while capturing traffic.
+* **Linux active probing mode (`--mode active`)**: Combines capture with audited probes and the Linux selective-egress filter.
+* **macOS capture mode**: Captures and rotates PCAP files through `tcpdump`/BPF without reconfiguring the interface. macOS does **not** provide net-tap's zero-egress or selective-egress guarantees; active mode is rejected.
 
 ---
 
@@ -76,6 +77,8 @@ To analyze the captured data:
 ```bash
 net-tap analyze -d /data/trace
 ```
+
+On macOS, `net-tap on -i en0 -o ./captures` starts a PCAP capture only. It does not block the host from transmitting on that interface.
 
 ---
 
@@ -232,7 +235,9 @@ sudo capsh --user=$USER --inh=cap_net_admin,cap_net_raw,cap_sys_admin --addamb=c
 
 ## System Requirements & Dependencies
 
-`net-tap` is designed exclusively for **Linux** kernels (3.10+; 4.19+ recommended for full `clsact` support). When running inside Docker or Podman, the container must be run with `--privileged` (or at minimum `--cap-add=NET_ADMIN --cap-add=NET_RAW`) to allow `tc` traffic control modifications and packet capturing.
+Linux supports kernels 3.10+ (4.19+ recommended for full `clsact` support). When running inside Docker or Podman, use `--privileged` (or at minimum `--cap-add=NET_ADMIN --cap-add=NET_RAW`) for Linux interface controls and packet capture.
+
+macOS supports capture and PCAP analysis only. Use Bash 4.3 or newer (for example, `brew install bash`) and ensure Homebrew's `bin` directory is on `PATH` so the script uses that Bash instead of the system Bash 3.2. Install `tcpdump`/libpcap tools, Python 3, Scapy, cryptography, and jsonschema for capture, fixture generation, and tests. Interface names and link diagnostics follow macOS conventions (for example, `en0`).
 
 ### Required Dependencies (Checked on startup)
 * `iproute2` (`ip`, `tc`, `ss`)
@@ -261,11 +266,19 @@ sudo dnf install -y \
   python3-scapy python3-jsonschema
 ```
 
+```bash
+# macOS (Homebrew)
+brew install bash shellcheck tcpdump jq
+python3 -m venv .venv
+source .venv/bin/activate
+python3 -m pip install scapy cryptography jsonschema
+```
+
 ---
 
 ## Installation & Uninstallation
 
-Run directly from the repository or install system-wide into `/usr/local/sbin`:
+Run directly from the repository or install system-wide. The default install location is `/usr/local/sbin` on Linux and Homebrew's prefix (`bin` for the executable) on macOS:
 
 ```bash
 # Clone the repository
@@ -291,13 +304,15 @@ net-tap [on|off|status|analyze|probe|list|clean] [options]
 
 | Subcommand | Privilege | Description |
 | :--- | :--- | :--- |
-| `on` | `sudo` | Provisions silent tap mode (passive or active), disables offloads, and spawns rotating background capture. |
-| `off` | `sudo` | Terminates capture, merges traces (if dual-port), removes `tc` drop filters, and restores original NIC state. |
-| `status` | Standard User | Inspects interface link status, speed, duplex, hardware drop counters, and active capture file sizes. |
+| `on` | `sudo` | On Linux, provisions passive/active tap mode and rotating capture; on macOS, starts read-only PCAP capture without egress blocking. |
+| `off` | `sudo` | Stops capture; Linux also removes `tc` filters and restores the original NIC state. |
+| `status` | Standard User | Inspects interface/capture status; detailed hardware counters and link tuning are Linux-only. |
 | `analyze` | Standard User | Performs deep protocol inspection and network mapping against a directory of PCAP traces. |
 | `probe` | `sudo` | Injects rate-limited discovery probes (ARP, NDP, DHCP, PMTU, TCP SYN) with structured audit trails. |
-| `list` | Standard User | Enumerates all active or stale monitoring sessions across host and network namespaces. |
+| `list` | Standard User | Enumerates capture sessions; Linux additionally supports network namespaces and stale-session cleanup. |
 | `clean` | `sudo` | Reconciles crashed sessions, terminates orphaned processes, purges stale locks, and detaches dangling filters. |
+
+On macOS, only `on`, `off`, `status`, `analyze`, and `list` are supported, and `on` performs capture without egress protection. `probe`, `clean`, namespaces, timed shutdown, and Linux-specific interface controls are unavailable.
 
 ---
 
@@ -1124,7 +1139,7 @@ sudo systemctl reload NetworkManager
 
 ## Testing & Quality Assurance
 
-`net-tap` includes an automated test harness covering linting, CLI parsing, privilege validation, synthetic dual-stack trace analysis, JSON schema verification, and root namespace lifecycle operations:
+`net-tap` includes platform-specific test coverage for linting, CLI parsing, synthetic trace analysis, and JSON schema verification:
 
 ### 1. Unprivileged Unit & Compliance Tests
 Runs ShellCheck (with zero tolerated warnings), tests CLI parameter boundaries, verifies offline PCAP profiling against synthetic carrier traces, and validates JSON output against both formal Draft-7 schemas and `jq` structural assertions:
@@ -1134,14 +1149,14 @@ make test
 ```
 
 ### 2. Privileged Integration & Network Namespace Suite
-Executes end-to-end operational tests in an ephemeral network namespace (`veth` pairs), asserts zero-egress hardware packet drop counts, validates BPF syntax rejection, and confirms atomic restoration of interface states:
+On Linux, executes end-to-end operational tests in an ephemeral network namespace (`veth` pairs), asserts zero-egress packet drop counts, validates BPF syntax rejection, and confirms interface state restoration. This target is Linux-only:
 
 ```bash
 make test-integration
 ```
 
 ### 3. Continuous Integration
-All commits and pull requests trigger automated GitHub Actions workflows running ShellCheck, unprivileged unit tests, and privileged Linux network namespace verification on Ubuntu runners.
+On macOS, `make test` runs PCAP analysis and platform-boundary tests; it does not claim to validate zero-egress behavior. CI additionally starts and stops a root-owned capture on loopback, while Linux CI runs the network namespace and egress-filter integration suite.
 
 ---
 

@@ -16,7 +16,7 @@ try:
     from scapy.layers.tls.all import TLS, TLSClientHello, TLS_Ext_ServerName, ServerName
 except ImportError as err:
     sys.stderr.write(f"ERROR: Scapy is required to generate test fixtures ({err}).\n")
-    sys.stderr.write("Install scapy via: pip install scapy or apt-get install python3-scapy\n")
+    sys.stderr.write("Install with: python3 -m pip install scapy cryptography (or your distribution's python3-scapy package).\n")
     sys.exit(1)
 
 packets = []

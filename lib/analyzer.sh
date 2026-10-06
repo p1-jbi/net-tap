@@ -3,7 +3,7 @@
 # shellcheck disable=SC2001,SC2317
 
 analyze_session() {
-    verify_dependencies
+    verify_capture_dependencies
 
     local target_dir="${OUT_DIR}"
 
@@ -15,7 +15,7 @@ analyze_session() {
     local pcap_files=()
     while IFS= read -r -d $'\0' f; do
         pcap_files+=("$f")
-    done < <(find "${target_dir}" -maxdepth 1 -type f \( -name "*_trace.pcap*" -o -name "*.pcap*" \) -print0 2>/dev/null)
+    done < <(find_files_in_dir "${target_dir}" "*_trace.pcap*" "*.pcap*")
 
     if [[ ${#pcap_files[@]} -eq 0 ]]; then
         log_err "No PCAP trace files found in ${target_dir}."
@@ -89,7 +89,7 @@ analyze_session() {
     local ddm_files=()
     while IFS= read -r -d $'\0' df; do
         ddm_files+=("$df")
-    done < <(find "${target_dir}" -maxdepth 1 -name "*_sfp_ddm.txt" -print0 2>/dev/null)
+    done < <(find_files_in_dir "${target_dir}" "*_sfp_ddm.txt")
     if [[ ${#ddm_files[@]} -gt 0 ]]; then
         echo -e "${C_CYAN}SFP Optical Diagnostics Detected:${C_RESET}"
         for df in "${ddm_files[@]}"; do
@@ -103,7 +103,7 @@ analyze_session() {
     local link_logs=()
     while IFS= read -r -d $'\0' lf; do
         link_logs+=("$lf")
-    done < <(find "${target_dir}" -maxdepth 1 -name "*_link_events.log" -print0 2>/dev/null)
+    done < <(find_files_in_dir "${target_dir}" "*_link_events.log")
 
     if [[ ${#link_logs[@]} -gt 0 ]]; then
         local flaps=0
@@ -733,7 +733,7 @@ analyze_session() {
     local audit_files=()
     while IFS= read -r -d $'\0' af; do
         audit_files+=("$af")
-    done < <(find "${target_dir}" -maxdepth 1 -name "*_probe_audit.jsonl" -print0 2>/dev/null | sort -z)
+    done < <(find_files_in_dir "${target_dir}" "*_probe_audit.jsonl")
 
     if [[ ${#audit_files[@]} -gt 0 ]]; then
         python3 -B -c '

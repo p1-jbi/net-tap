@@ -5,6 +5,10 @@
 # lib/probe.sh - Orchestration wrapper for Net-Tap active probing
 
 run_probe() {
+    if [[ "${NET_TAP_OS}" != "Linux" ]]; then
+        log_err "Active probing is currently Linux-only; the macOS capture backend does not provide selective-egress protection."
+        exit 1
+    fi
     require_root
 
     if [[ -z "${IFACE:-}" ]]; then

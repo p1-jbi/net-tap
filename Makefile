@@ -1,6 +1,12 @@
+ifeq ($(shell uname -s),Darwin)
+PREFIX ?= $(shell brew --prefix 2>/dev/null || echo /usr/local)
+BINDIR ?= $(PREFIX)/bin
+else
 PREFIX ?= /usr/local
 BINDIR ?= $(PREFIX)/sbin
+endif
 LIBDIR ?= $(PREFIX)/lib/net-tap
+BASH ?= bash
 
 export PYTHONDONTWRITEBYTECODE = 1
 
@@ -25,7 +31,7 @@ lint:
 	@echo "Running ShellCheck on scripts..."
 	@if command -v shellcheck >/dev/null 2>&1; then \
 		set -e; \
-		shellcheck bin/net-tap.sh lib/*.sh tests/run_tests.sh && echo "ShellCheck passed!"; \
+		shellcheck bin/net-tap.sh lib/*.sh tests/run_tests.sh tests/run_macos_tests.sh tests/run_macos_capture_test.sh && echo "ShellCheck passed!"; \
 	else \
 		echo "Error: shellcheck is not installed. Failing lint step." >&2; \
 		exit 1; \
@@ -48,16 +54,31 @@ fixtures:
 		exit 1; \
 	fi
 
+ifeq ($(shell uname -s),Darwin)
+test: lint fixtures
+	@echo "Running macOS capture/analysis and platform-boundary tests..."
+	@$(BASH) tests/run_macos_tests.sh
+
+test-integration:
+	@echo "Linux network namespace integration tests are unavailable on macOS." >&2
+	@exit 1
+else
 test: lint fixtures
 	@echo "Running automated compliance and unit tests..."
-	@bash tests/run_tests.sh
+	@$(BASH) tests/run_tests.sh
 
 test-integration: lint fixtures
 	@echo "Running integration tests (requires root)..."
-	@sudo PYTHONDONTWRITEBYTECODE=1 bash tests/run_tests.sh
+	@sudo PYTHONDONTWRITEBYTECODE=1 $(BASH) tests/run_tests.sh
+endif
 
 clean:
-	@rm -rf tests/__pycache__ /tmp/pmtud.pcap
-	@find /tmp -maxdepth 1 -user "$$(id -u)" -name "net-tap-*" -exec rm -rf {} + 2>/dev/null || true
+	@rm -rf tests/__pycache__ "$${TMPDIR:-/tmp}/pmtud.pcap"
+	@for path in "$${TMPDIR:-/tmp}"/net-tap-*; do \
+		[ -e "$$path" ] || continue; \
+		if [ "$$(uname -s)" = Darwin ]; then owner=$$(stat -f '%u' "$$path" 2>/dev/null); \
+		else owner=$$(stat -c '%u' "$$path" 2>/dev/null); fi; \
+		[ "$$owner" = "$$(id -u)" ] && rm -rf "$$path"; \
+	done
 
 .PHONY: all install installcheck uninstall lint fixtures test test-integration clean

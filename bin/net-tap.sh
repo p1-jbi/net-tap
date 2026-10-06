@@ -6,14 +6,25 @@
 set -euo pipefail
 shopt -s inherit_errexit 2>/dev/null || true
 
+NET_TAP_OS="${NET_TAP_OS:-$(uname -s)}"
+if [[ "${NET_TAP_OS}" == "Darwin" ]] && (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 3) )); then
+    echo "ERROR: macOS requires Bash 4.3 or newer. Install with Homebrew (brew install bash) and run net-tap with that Bash." >&2
+    exit 1
+fi
+
 # Resolve the absolute path to the directory containing this script
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
 # Determine the library path (supports local repo, relative install, and FHS system paths)
 if [[ -n "${NET_TAP_LIB_DIR:-}" && -f "${NET_TAP_LIB_DIR}/core.sh" ]]; then
     if [[ $EUID -eq 0 ]]; then
-        lib_owner=$(stat -c "%u" "${NET_TAP_LIB_DIR}" 2>/dev/null || echo "-1")
-        lib_perm=$(stat -c "%a" "${NET_TAP_LIB_DIR}" 2>/dev/null || echo "777")
+        if [[ "${NET_TAP_OS}" == "Darwin" ]]; then
+            lib_owner=$(stat -f "%u" "${NET_TAP_LIB_DIR}" 2>/dev/null || echo "-1")
+            lib_perm=$(stat -f "%Lp" "${NET_TAP_LIB_DIR}" 2>/dev/null || echo "777")
+        else
+            lib_owner=$(stat -c "%u" "${NET_TAP_LIB_DIR}" 2>/dev/null || echo "-1")
+            lib_perm=$(stat -c "%a" "${NET_TAP_LIB_DIR}" 2>/dev/null || echo "777")
+        fi
         if [[ "${lib_owner}" -ne 0 ]] || [[ "${lib_perm: -1}" =~ [2367] ]]; then
             echo "ERROR: Untrusted NET_TAP_LIB_DIR '${NET_TAP_LIB_DIR}' must be owned by root and not writable by other users!" >&2
             exit 1
@@ -33,10 +44,12 @@ else
     exit 1
 fi
 
+source "${LIB_DIR}/platform.sh"
 source "${LIB_DIR}/core.sh"
 source "${LIB_DIR}/orchestration.sh"
 source "${LIB_DIR}/analyzer.sh"
 source "${LIB_DIR}/probe.sh"
+source "${LIB_DIR}/macos.sh"
 
 main() {
     # Check for help early
@@ -77,7 +90,7 @@ main() {
     PROBE_TIMEOUT=5
     PROBE_AUDIT_ID=""
 
-    SCRIPT_PATH=$(readlink -f "$0")
+    SCRIPT_PATH=$(canonical_path "$0")
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -260,7 +273,7 @@ main() {
             log_err "Output directory cannot start with a hyphen: '${OUT_DIR}'"
             exit 1
         fi
-        OUT_DIR=$(readlink -m "${OUT_DIR}")
+        OUT_DIR=$(canonical_path_allow_missing "${OUT_DIR}")
     fi
     if [[ -n "${SPEED}" ]] && ! [[ "${SPEED}" =~ ^[1-9][0-9]*$ ]]; then
         log_err "Speed must be a positive integer in Mbps."
@@ -352,6 +365,11 @@ main() {
                 BPF_FILTER="(${BPF_FILTER}) or (mpls and (${BPF_FILTER}))"
             fi
         fi
+    fi
+
+    if [[ "${NET_TAP_OS}" == "Darwin" && -n "${NETNS}" ]]; then
+        log_err "Network namespaces are Linux-only and are not available on macOS."
+        exit 1
     fi
 
     local safe_iface="${IFACE//\//_}"

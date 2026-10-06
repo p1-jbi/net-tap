@@ -14,7 +14,7 @@
 #
 
 set -euo pipefail
-export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+export PATH="/opt/homebrew/sbin:/opt/homebrew/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
 # --- Default Settings ---
 DEFAULT_OUT_DIR="./captures"
@@ -43,9 +43,27 @@ _syslog() {
     shift
     if command -v logger >/dev/null 2>&1; then
         local clean_msg
-        clean_msg=$(printf "%s" "$*" | sed -r 's/\x1B\[[0-9;]*[mK]//g')
+        clean_msg=$(printf "%s" "$*" | sed -E 's/\x1B\[[0-9;]*[mK]//g')
         logger -t net-tap "[${level}] ${clean_msg}" || true
     fi
+}
+
+verify_dependencies() {
+    if [[ "${NET_TAP_OS}" != "Linux" ]]; then
+        log_err "This operation requires Linux kernel networking support."
+        exit 1
+    fi
+    local missing=()
+    for cmd in ip tc ethtool dmesg ss readlink flock sysctl stat; do
+        if ! command -v "$cmd" >/dev/null 2>&1; then
+            missing+=("$cmd")
+        fi
+    done
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        log_err "Missing required Linux dependencies: ${missing[*]}"
+        exit 1
+    fi
+    verify_capture_dependencies
 }
 
 log_info()  { 
@@ -66,9 +84,9 @@ log_err()   {
 }
 
 # --- Carrier-Grade Verifications ---
-verify_dependencies() {
+verify_capture_dependencies() {
     local missing=()
-    for cmd in ip tc tcpdump ethtool awk dmesg grep sed find ss df du mktemp readlink gzip flock sysctl stat date; do
+    for cmd in tcpdump awk grep sed find df du mktemp gzip date python3 sort paste tail tr wc cat; do
         if ! command -v "$cmd" >/dev/null 2>&1; then
             missing+=("$cmd")
         fi
@@ -100,6 +118,10 @@ require_root() {
     if [[ $EUID -eq 0 ]]; then
         return 0
     fi
+    if [[ "${NET_TAP_OS}" == "Darwin" ]]; then
+        log_err "This operation requires root privileges. Please run with sudo."
+        exit 1
+    fi
     if command -v capsh >/dev/null 2>&1; then
         if [[ -n "${NETNS:-}" ]]; then
             if capsh --has-p=cap_net_admin 2>/dev/null && capsh --has-p=cap_net_raw 2>/dev/null && capsh --has-p=cap_sys_admin 2>/dev/null; then
@@ -127,15 +149,15 @@ load_state_file() {
         return 1
     fi
     local real_sfile real_sdir
-    real_sfile=$(readlink -f "${sfile}" 2>/dev/null || true)
-    real_sdir=$(readlink -f "${STATE_DIR}" 2>/dev/null || true)
+    real_sfile=$(canonical_path "${sfile}" 2>/dev/null || true)
+    real_sdir=$(canonical_path "${STATE_DIR}" 2>/dev/null || true)
     if [[ -z "${real_sfile}" || -z "${real_sdir}" || "${real_sfile}" != "${real_sdir}"/* ]]; then
         log_err "Security violation: State file '${sfile}' resolves outside STATE_DIR (${STATE_DIR})."
         return 1
     fi
     local sdir_owner sdir_perm
-    sdir_owner=$(stat -c "%u" "${real_sdir}" 2>/dev/null || echo "-1")
-    sdir_perm=$(stat -c "%a" "${real_sdir}" 2>/dev/null || echo "777")
+    sdir_owner=$(stat_value "%u" "${real_sdir}" 2>/dev/null || echo "-1")
+    sdir_perm=$(stat_value "%a" "${real_sdir}" 2>/dev/null || echo "777")
     if [[ "${sdir_owner}" -ne 0 && "${sdir_owner}" -ne "${EUID}" ]]; then
         log_err "Security violation: STATE_DIR '${real_sdir}' is not owned by root (UID 0) or current user."
         return 1
@@ -145,17 +167,17 @@ load_state_file() {
         return 1
     fi
     local file_owner perm
-    file_owner=$(stat -c "%u" "${sfile}" 2>/dev/null || echo "-1")
+    file_owner=$(stat_value "%u" "${sfile}" 2>/dev/null || echo "-1")
     if [[ "${file_owner}" -ne 0 && "${file_owner}" -ne "${EUID}" ]]; then
         log_err "Security violation: State file '${sfile}' is not owned by root (UID 0) or current user."
         return 1
     fi
-    perm=$(stat -c "%a" "${sfile}" 2>/dev/null || echo "777")
+    perm=$(stat_value "%a" "${sfile}" 2>/dev/null || echo "777")
     if [[ "${perm}" != "600" && "${perm}" != "640" && "${perm}" != "644" && "${perm}" != "400" && "${perm}" != "440" && "${perm}" != "444" ]]; then
         log_err "Security violation: State file '${sfile}' has unsafe permissions (${perm})."
         return 1
     fi
-    if [[ $(stat -c "%h" "${sfile}" 2>/dev/null || echo "0") -ne 1 ]]; then
+    if [[ $(stat_value "%h" "${sfile}" 2>/dev/null || echo "0") -ne 1 ]]; then
         log_err "Security violation: State file '${sfile}' has multiple hard links."
         return 1
     fi
@@ -209,14 +231,14 @@ safe_kill() {
 
     if kill -0 "${target_pid}" 2>/dev/null; then
         local actual_comm
-        actual_comm=$(cat "/proc/${target_pid}/comm" 2>/dev/null || echo "")
+        actual_comm=$(process_comm "${target_pid}" 2>/dev/null || echo "")
         if ! echo "${actual_comm}" | grep -qE "^(${expected_comm})$"; then
             log_warn "PID ${target_pid} comm '${actual_comm}' did not match expected '${expected_comm}'. Skipping termination."
             return 0
         fi
         if [[ -n "${expected_cmd}" ]]; then
             local actual_cmd
-            actual_cmd=$(tr '\0' ' ' < "/proc/${target_pid}/cmdline" 2>/dev/null || echo "")
+            actual_cmd=$(process_command "${target_pid}" 2>/dev/null || echo "")
             if ! echo "${actual_cmd}" | grep -qE "${expected_cmd}"; then
                 log_warn "PID ${target_pid} cmdline did not match expected pattern '${expected_cmd}'. Skipping termination."
                 return 0
@@ -231,14 +253,14 @@ safe_kill() {
         # Re-verify process identity before SIGKILL to defend against PID recycling
         if kill -0 "${target_pid}" 2>/dev/null; then
             local verify_comm
-            verify_comm=$(cat "/proc/${target_pid}/comm" 2>/dev/null || echo "")
+            verify_comm=$(process_comm "${target_pid}" 2>/dev/null || echo "")
             if ! echo "${verify_comm}" | grep -qE "^(${expected_comm})$"; then
                 log_warn "PID ${target_pid} identity changed during shutdown (new comm: '${verify_comm}'). Skipping SIGKILL to avoid killing recycled process."
                 return 0
             fi
             if [[ -n "${expected_cmd}" ]]; then
                 local verify_cmd
-                verify_cmd=$(tr '\0' ' ' < "/proc/${target_pid}/cmdline" 2>/dev/null || echo "")
+                verify_cmd=$(process_command "${target_pid}" 2>/dev/null || echo "")
                 if ! echo "${verify_cmd}" | grep -qE "${expected_cmd}"; then
                     log_warn "PID ${target_pid} cmdline changed during shutdown. Skipping SIGKILL."
                     return 0
@@ -351,6 +373,10 @@ Commands:
   probe     Execute active, controlled discovery probes with audit logging and rate-limiting.
   list      Enumerate all active net-tap sessions and background captures.
   clean     Reconcile crashed sessions, purge stale locks, and detach dangling filters.
+
+Platform support:
+  Linux     Full passive/active tap, interface controls, namespaces, and analysis.
+  macOS     PCAP capture and analysis only; egress protection, active probes, and namespaces are unavailable.
 
 Options:
   -i, --interface <iface>   Target network interface (required for on, off, status, probe; optional for list, clean).

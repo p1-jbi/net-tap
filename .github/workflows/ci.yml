@@ -19,7 +19,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-22.04, ubuntu-24.04]
+        os: [ubuntu-22.04, ubuntu-24.04, macos-14]
     runs-on: ${{ matrix.os }}
     env:
       PYTHONDONTWRITEBYTECODE: "1"
@@ -28,6 +28,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install System Dependencies
+        if: runner.os == 'Linux'
         env:
           DEBIAN_FRONTEND: noninteractive
         run: |
@@ -44,21 +45,34 @@ jobs:
             python3-scapy \
             python3-jsonschema
 
+      - name: Install macOS Dependencies
+        if: runner.os == 'macOS'
+        run: |
+          brew install bash shellcheck jq
+          python3 -m pip install --user --break-system-packages scapy cryptography jsonschema
+          echo "$(brew --prefix)/bin" >> "$GITHUB_PATH"
+
       - name: Run ShellCheck & Unprivileged Tests
         run: |
           make test
 
       - name: Run Privileged Namespace Integration Tests
+        if: runner.os == 'Linux'
         run: |
           sudo PYTHONDONTWRITEBYTECODE=1 tests/run_tests.sh
 
+      - name: Run Privileged macOS Capture Test
+        if: runner.os == 'macOS'
+        run: |
+          sudo env PATH="$PATH" bash tests/run_macos_capture_test.sh
+
       - name: Normalize Artifact Permissions
-        if: failure()
+        if: failure() && runner.os == 'Linux'
         run: |
           sudo chmod -R a+r /var/run/net-tap/ /tmp/net-tap-* 2>/dev/null || true
 
       - name: Archive Test Failure Diagnostics
-        if: failure()
+        if: failure() && runner.os == 'Linux'
         uses: actions/upload-artifact@v4
         with:
           name: test-failure-diagnostics-${{ matrix.os }}

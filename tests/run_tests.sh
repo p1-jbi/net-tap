@@ -5,6 +5,11 @@
 set -euo pipefail
 export PYTHONDONTWRITEBYTECODE=1
 
+if [[ "$(uname -s)" != "Linux" ]]; then
+    echo "This namespace and egress-filter test suite is Linux-only; use make test for macOS checks." >&2
+    exit 1
+fi
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BIN_PATH="${SCRIPT_DIR}/../bin/net-tap.sh"
 FIXTURES_DIR="${SCRIPT_DIR}/fixtures"
@@ -23,7 +28,7 @@ for cmd in ip tc awk grep mktemp; do
     fi
 done
 
-# shellcheck disable=SC2317
+# shellcheck disable=SC2317,SC2329
 cleanup() {
     local exit_code=$?
     if [[ -n "${TMP_PRIV_DIR:-}" ]]; then rm -rf "${TMP_PRIV_DIR}" 2>/dev/null || true; fi

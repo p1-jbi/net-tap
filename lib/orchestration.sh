@@ -1,10 +1,23 @@
 #!/usr/bin/env bash
 # shellcheck shell=bash
-# shellcheck disable=SC2317,SC2015,SC1091,SC2086
+# shellcheck disable=SC2317,SC2329,SC2015,SC1091,SC2086
 
 # --- Function: Comprehensive Physical Link Detection ---
 detect_port_status() {
     local target_iface="$1"
+    if [[ "${NET_TAP_OS}" == "Darwin" ]]; then
+        local ifconfig_out
+        ifconfig_out=$(ifconfig "${target_iface}" 2>/dev/null) || {
+            echo "INACTIVE|N/A|N/A|unknown"
+            return
+        }
+        if echo "${ifconfig_out}" | grep -qE 'status: active|<[^>]*,UP[,>]'; then
+            echo "ACTIVE|N/A|N/A|up"
+        else
+            echo "INACTIVE|N/A|N/A|down"
+        fi
+        return
+    fi
     local carrier_file="/sys/class/net/${target_iface}/carrier"
     local operstate_file="/sys/class/net/${target_iface}/operstate"
     local carrier="0"
@@ -226,6 +239,10 @@ _disk_watchdog_worker() {
 
 # --- Function: Enable Silent Tap Mode ---
 start_tap() {
+    if [[ "${NET_TAP_OS}" == "Darwin" ]]; then
+        start_tap_macos
+        return
+    fi
     require_root
     verify_dependencies
 
@@ -715,6 +732,10 @@ render_status_dashboard() {
 
 # --- Function: Stop Tap & Reset Interface ---
 stop_tap() {
+    if [[ "${NET_TAP_OS}" == "Darwin" ]]; then
+        stop_tap_macos
+        return
+    fi
     require_root
 
     if [[ -z "${IFACE}" ]]; then
@@ -892,6 +913,10 @@ stop_tap() {
 
 # --- Function: Inspect Running State ---
 status_tap() {
+    if [[ "${NET_TAP_OS}" == "Darwin" ]]; then
+        status_tap_macos
+        return
+    fi
     verify_dependencies
 
     if [[ -z "${IFACE}" ]]; then
@@ -969,6 +994,10 @@ status_tap() {
 }
 
 list_sessions() {
+    if [[ "${NET_TAP_OS}" == "Darwin" ]]; then
+        list_sessions_macos
+        return
+    fi
     local found_sessions=0
     local json_sessions=()
 
@@ -1031,7 +1060,10 @@ list_sessions() {
 
         local chunk_count=0
         if [[ -n "${s_out_dir}" && -d "${s_out_dir}" ]]; then
-            chunk_count=$(find "${s_out_dir}" -maxdepth 1 -name "*${s_iface}*.pcap*" 2>/dev/null | wc -l)
+            local chunk
+            for chunk in "${s_out_dir}"/*"${s_iface}"*.pcap*; do
+                [[ -f "${chunk}" ]] && chunk_count=$((chunk_count + 1))
+            done
         fi
 
         if [[ "${JSON_OUT:-0}" -eq 1 ]]; then
@@ -1065,6 +1097,10 @@ list_sessions() {
 }
 
 clean_sessions() {
+    if [[ "${NET_TAP_OS}" != "Linux" ]]; then
+        log_err "Session cleanup of Linux kernel networking state is only supported on Linux."
+        exit 1
+    fi
     require_root
     log_info "Reconciling net-tap sessions and purging stale state/locks..."
 
